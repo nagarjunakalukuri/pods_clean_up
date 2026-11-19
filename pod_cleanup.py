@@ -34,7 +34,8 @@ def run_oc(args, timeout=120):
     cmd = ["oc", *args]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True, timeout=timeout
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=True, timeout=timeout
         )
     except FileNotFoundError:
         raise OcError("OpenShift CLI (oc) not found in PATH.")
@@ -97,8 +98,30 @@ def find_eligible(pods, statuses, older_than_hours):
         age = age_hours(pod)
         if age < older_than_hours:
             continue
-        eligible.append((ns, name, phase, age))
+        eligible.append((ns, name, phase, age, meta.get("uid", "")))
     return eligible
+
+
+def still_eligible(ns, name, uid, statuses):
+    """Re-fetch the pod right before deleting it.
+
+    Returns (ok, reason). A pod can be replaced between listing and deleting
+    (e.g. a StatefulSet recreating a failed pod under the same name), so skip
+    it unless it is the same pod (same UID) and still eligible.
+    """
+    out = run_oc(["get", "pod", name, "-n", ns, "--ignore-not-found", "-o", "json"])
+    if not out.strip():
+        return False, "already gone"
+    pod = json.loads(out)
+    meta = pod["metadata"]
+    if uid and meta.get("uid") != uid:
+        return False, "pod was replaced (UID changed)"
+    if meta.get("deletionTimestamp"):
+        return False, "already terminating"
+    phase = pod.get("status", {}).get("phase", "Unknown")
+    if phase not in statuses:
+        return False, f"phase is now {phase}"
+    return True, ""
 
 
 def confirm(count):
@@ -111,7 +134,7 @@ def confirm(count):
 def cleanup_pods(dry_run, statuses, namespaces, older_than_hours, show_all, assume_yes):
     user = run_oc(["whoami"]).strip()
     print(f"Connected user: {user}")
-    print(f"Dry run       : {dry_run}")
+    print(f"Dry run       : {str(dry_run).lower()}")
     print(f"Delete phases : {', '.join(sorted(statuses))}")
     if namespaces:
         print(f"Namespaces    : {', '.join(namespaces)}")
@@ -132,17 +155,22 @@ def cleanup_pods(dry_run, statuses, namespaces, older_than_hours, show_all, assu
     print("\n========== ELIGIBLE PODS ==========")
     if not eligible:
         print("None.")
-    for ns, name, phase, age in eligible:
+    for ns, name, phase, age, _uid in eligible:
         print(f"{ns}/{name}  [{phase}, {age}h old]")
 
-    deleted = failed = 0
+    deleted = failed = skipped = 0
     if eligible and not dry_run:
         if not assume_yes and not confirm(len(eligible)):
             print("Aborted. No pods were deleted.")
             return 1
         print("\n========== DELETING PODS ==========")
-        for ns, name, _phase, _age in eligible:
+        for ns, name, _phase, _age, uid in eligible:
             try:
+                ok, reason = still_eligible(ns, name, uid, statuses)
+                if not ok:
+                    print(f"SKIPPED: {ns}/{name}: {reason}")
+                    skipped += 1
+                    continue
                 run_oc(["delete", "pod", name, "-n", ns, "--wait=false"])
                 print(f"Deletion requested: {ns}/{name}")
                 deleted += 1
@@ -154,8 +182,9 @@ def cleanup_pods(dry_run, statuses, namespaces, older_than_hours, show_all, assu
     print(f"Total pods scanned : {len(pods)}")
     print(f"Eligible pods      : {len(eligible)}")
     print(f"Deletion requested : {deleted}")
+    print(f"Skipped (changed)  : {skipped}")
     print(f"Deletion failures  : {failed}")
-    print(f"Dry run enabled    : {dry_run}")
+    print(f"Dry run enabled    : {str(dry_run).lower()}")
 
     if dry_run:
         print("\nDRY RUN: No pods were deleted. Use --execute to delete.")
@@ -179,6 +208,9 @@ def main():
                         help="Also print the full pod inventory.")
     args = parser.parse_args()
 
+    if args.older_than_hours < 0:
+        parser.error("--older-than-hours must be a non-negative integer.")
+
     try:
         statuses = parse_statuses(args.delete_status)
     except ValueError as e:
@@ -188,7 +220,7 @@ def main():
         return cleanup_pods(
             dry_run=not args.execute,
             statuses=statuses,
-            namespaces=args.namespace,
+            namespaces=list(dict.fromkeys(args.namespace)) if args.namespace else None,
             older_than_hours=args.older_than_hours,
             show_all=args.show_all,
             assume_yes=args.yes,

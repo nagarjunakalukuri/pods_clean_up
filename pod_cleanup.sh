@@ -5,6 +5,7 @@
 # (and, unless --yes is given, after an interactive confirmation).
 #
 # Requires: oc, jq. Save with LF line endings.
+# (Trailing CRs from a Windows jq.exe are stripped from jq output.)
 
 set -u -o pipefail
 
@@ -48,7 +49,10 @@ while [[ $# -gt 0 ]]; do
             DELETE_STATUSES_CSV="$2"; shift ;;
         --namespace)
             [[ $# -ge 2 ]] || die "--namespace requires a value"
-            NAMESPACES+=("$2"); shift ;;
+            dup=false
+            for ns in ${NAMESPACES[@]+"${NAMESPACES[@]}"}; do [[ "$ns" == "$2" ]] && dup=true; done
+            $dup || NAMESPACES+=("$2")
+            shift ;;
         --older-than-hours)
             [[ $# -ge 2 ]] || die "--older-than-hours requires a value"
             OLDER_THAN_HOURS="$2"; shift ;;
@@ -111,23 +115,26 @@ fetch_pods() {
 # ---------- collect pods ----------
 PODS_JSON=$(fetch_pods) || die "Failed to list pods."
 
-# One TSV line per pod: namespace, name, phase, terminating, age in hours.
+# One TSV line per pod: namespace, name, phase, terminating, age in hours, uid.
 POD_TSV=$(printf '%s' "$PODS_JSON" | jq -r -s '
     [.[].items[]] | .[] | [
         .metadata.namespace,
         .metadata.name,
         (.status.phase // "Unknown"),
         (if .metadata.deletionTimestamp then "true" else "false" end),
-        (((now - (.metadata.creationTimestamp | fromdateiso8601)) / 3600) | floor)
+        (if .metadata.creationTimestamp
+            then (((now - (.metadata.creationTimestamp | fromdateiso8601)) / 3600) | floor)
+            else 0 end),
+        (.metadata.uid // "")
     ] | @tsv
-') || die "Failed to parse pod list with jq."
+' | tr -d '\r') || die "Failed to parse pod list with jq."
 
 TOTAL=0
-ELIG_NS=(); ELIG_NAME=(); ELIG_PHASE=(); ELIG_AGE=()
+ELIG_NS=(); ELIG_NAME=(); ELIG_PHASE=(); ELIG_AGE=(); ELIG_UID=()
 
 [[ "$SHOW_ALL" == "true" ]] && echo -e "\n========== POD INVENTORY =========="
 
-while IFS=$'\t' read -r namespace name phase terminating age; do
+while IFS=$'\t' read -r namespace name phase terminating age uid; do
     [[ -z "$name" ]] && continue
     TOTAL=$((TOTAL + 1))
 
@@ -139,7 +146,7 @@ while IFS=$'\t' read -r namespace name phase terminating age; do
     [[ "$age" -lt "$OLDER_THAN_HOURS" ]]      && continue
 
     ELIG_NS+=("$namespace"); ELIG_NAME+=("$name")
-    ELIG_PHASE+=("$phase");  ELIG_AGE+=("$age")
+    ELIG_PHASE+=("$phase");  ELIG_AGE+=("$age"); ELIG_UID+=("$uid")
 done <<< "$POD_TSV"
 
 ELIGIBLE=${#ELIG_NS[@]}
@@ -155,6 +162,33 @@ done
 # ---------- delete ----------
 DELETED=0
 FAILED=0
+SKIPPED=0
+
+# Re-fetch a pod right before deleting it. A pod can be replaced between
+# listing and deleting (e.g. a StatefulSet recreating a failed pod under the
+# same name), so skip it unless it is the same pod (same UID) and still eligible.
+# Usage: recheck_pod NS NAME UID. Returns 0 = ok, 1 = skip (reason in
+# RECHECK_REASON), 2 = lookup error.
+recheck_pod() {
+    local out cur_uid cur_term cur_phase
+    out=$(oc get pod "$2" -n "$1" --ignore-not-found -o json </dev/null)         || { RECHECK_REASON="lookup failed"; return 2; }
+    [[ -n "$out" ]] || { RECHECK_REASON="already gone"; return 1; }
+    IFS=$'\t' read -r cur_uid cur_term cur_phase < <(printf '%s' "$out" | jq -r '[
+        .metadata.uid,
+        (if .metadata.deletionTimestamp then "true" else "false" end),
+        (.status.phase // "Unknown")
+    ] | @tsv' | tr -d '\r') || { RECHECK_REASON="lookup failed"; return 2; }
+    if [[ -n "$3" && "$cur_uid" != "$3" ]]; then
+        RECHECK_REASON="pod was replaced (UID changed)"; return 1
+    fi
+    if [[ "$cur_term" == "true" ]]; then
+        RECHECK_REASON="already terminating"; return 1
+    fi
+    if ! is_delete_status "$cur_phase"; then
+        RECHECK_REASON="phase is now $cur_phase"; return 1
+    fi
+    return 0
+}
 
 if [[ $ELIGIBLE -gt 0 && "$DRY_RUN" == "false" ]]; then
     if [[ "$ASSUME_YES" != "true" ]]; then
@@ -168,6 +202,17 @@ if [[ $ELIGIBLE -gt 0 && "$DRY_RUN" == "false" ]]; then
 
     echo -e "\n========== DELETING PODS =========="
     for ((i = 0; i < ELIGIBLE; i++)); do
+        recheck_pod "${ELIG_NS[i]}" "${ELIG_NAME[i]}" "${ELIG_UID[i]}"
+        rc=$?
+        if [[ $rc -eq 1 ]]; then
+            echo "SKIPPED: ${ELIG_NS[i]}/${ELIG_NAME[i]}: $RECHECK_REASON"
+            SKIPPED=$((SKIPPED + 1))
+            continue
+        elif [[ $rc -ne 0 ]]; then
+            echo "FAILED: ${ELIG_NS[i]}/${ELIG_NAME[i]}: $RECHECK_REASON"
+            FAILED=$((FAILED + 1))
+            continue
+        fi
         if oc delete pod "${ELIG_NAME[i]}" -n "${ELIG_NS[i]}" --wait=false </dev/null; then
             echo "Deletion requested: ${ELIG_NS[i]}/${ELIG_NAME[i]}"
             DELETED=$((DELETED + 1))
@@ -183,6 +228,7 @@ echo -e "\n========== CLEANUP SUMMARY =========="
 echo "Total pods scanned : $TOTAL"
 echo "Eligible pods      : $ELIGIBLE"
 echo "Deletion requested : $DELETED"
+echo "Skipped (changed)  : $SKIPPED"
 echo "Deletion failures  : $FAILED"
 echo "Dry run enabled    : $DRY_RUN"
 
